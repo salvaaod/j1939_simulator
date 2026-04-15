@@ -15,9 +15,10 @@ TIMING1_250K = 0x1C
 
 PGN_CCVS = 0x00FEF1  # SPN 84: wheel-based vehicle speed
 PGN_ETC2 = 0x00F005  # SPN 523: transmission current gear
-PGN_LC = 0x00FE41  # SPN 2369/2367: turn signals
+PGN_OEL = 0x00FDCC  # SPN 2876: operator external light controls (turn signals)
 
 PRIORITY_DEFAULT = 6
+PRIORITY_OEL = 3
 SOURCE_ADDRESS = 0x00
 
 
@@ -27,12 +28,13 @@ def j1939_id(priority: int, pgn: int, source_address: int) -> int:
 
 def build_ccvs_data(speed_kmh: float, brake_active: bool) -> list[int]:
     raw_speed = int(max(0.0, min(float(speed_kmh), 250.996)) * 256)
-    data = [0xFF] * 8
+    data = [0x00] * 8
     data[1] = raw_speed & 0xFF
     data[2] = (raw_speed >> 8) & 0xFF
-    # SPN 597: Brake switch, byte 4 bits 3-4
+    # SPN 597: Brake switch, byte 4 bits 5-6
+    # 0x00: brake released, 0x01: brake depressed
     brake_switch = 0b01 if brake_active else 0b00
-    data[3] = (data[3] & ~(0b11 << 2)) | (brake_switch << 2)
+    data[3] = brake_switch << 4
     return data
 
 
@@ -43,18 +45,17 @@ def build_etc2_data(gear_choice: str) -> list[int]:
         "Drive": 126,  # 1 + 125 offset
         "Park": 251,  # per J1939 SPN 523 definition
     }
-    data = [0xFF] * 8
+    data = [0x00] * 8
     data[3] = gear_map.get(gear_choice, 125)
     return data
 
 
 def build_lc_data(left_active: bool, right_active: bool) -> list[int]:
-    data = [0xFF] * 8
-    # SPN 2369 Right turn command at 2.5 (byte 2 bits 5-6)
-    # SPN 2367 Left turn command at 2.7 (byte 2 bits 7-8)
-    right_cmd = 0b01 if right_active else 0b00
-    left_cmd = 0b01 if left_active else 0b00
-    data[1] = (data[1] & 0x0F) | (right_cmd << 4) | (left_cmd << 6)
+    data = [0x00] * 8
+    # OEL / SPN 2876 in this project: byte 2 bit 1 = left, bit 2 = right
+    left_cmd = 0x01 if left_active else 0x00
+    right_cmd = 0x02 if right_active else 0x00
+    data[1] = left_cmd | right_cmd
     return data
 
 
@@ -231,7 +232,7 @@ class SimulatorApp:
         self.etc2_text = tk.StringVar(value="")
         ttk.Label(main, textvariable=self.etc2_text).grid(row=9, column=1, sticky="w")
 
-        ttk.Label(main, text="LC ID/Data").grid(row=10, column=0, sticky="w")
+        ttk.Label(main, text="OEL ID/Data").grid(row=10, column=0, sticky="w")
         self.lc_text = tk.StringVar(value="")
         ttk.Label(main, textvariable=self.lc_text).grid(row=10, column=1, sticky="w")
 
@@ -343,7 +344,7 @@ class SimulatorApp:
         return frame_id, build_etc2_data(self.gear.get())
 
     def current_lc_frame(self) -> tuple[int, list[int]]:
-        frame_id = j1939_id(PRIORITY_DEFAULT, PGN_LC, self.current_source_address())
+        frame_id = j1939_id(PRIORITY_OEL, PGN_OEL, self.current_source_address())
         return frame_id, build_lc_data(self.turn_left.get(), self.turn_right.get())
 
     def current_frames(self) -> list[tuple[int, list[int]]]:
