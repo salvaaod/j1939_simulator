@@ -30,9 +30,10 @@ def build_ccvs_data(speed_kmh: float, brake_active: bool) -> list[int]:
     data = [0xFF] * 8
     data[1] = raw_speed & 0xFF
     data[2] = (raw_speed >> 8) & 0xFF
-    # SPN 597: Brake switch, byte 4 bits 3-4
+    # SPN 597: Brake switch, byte 4 bits 5-6
+    # 0x00: brake released, 0x01: brake depressed
     brake_switch = 0b01 if brake_active else 0b00
-    data[3] = (data[3] & ~(0b11 << 2)) | (brake_switch << 2)
+    data[3] = brake_switch << 4
     return data
 
 
