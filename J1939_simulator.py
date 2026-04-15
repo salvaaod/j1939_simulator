@@ -16,8 +16,6 @@ TIMING1_250K = 0x1C
 PGN_CCVS = 0x00FEF1  # SPN 84: wheel-based vehicle speed
 PGN_ETC2 = 0x00F005  # SPN 523: transmission current gear
 PGN_LC = 0x00FE41  # SPN 2369/2367: turn signals
-PGN_DC1 = 0x00FE4E  # SPN 1821: position of doors
-PGN_CLASS_IV_V_SWITCH = 0x00FF00  # Camera view switching (Class IV/V)
 
 PRIORITY_DEFAULT = 6
 SOURCE_ADDRESS = 0x00
@@ -27,11 +25,14 @@ def j1939_id(priority: int, pgn: int, source_address: int) -> int:
     return ((priority & 0x7) << 26) | ((pgn & 0x3FFFF) << 8) | (source_address & 0xFF)
 
 
-def build_ccvs_data(speed_kmh: float) -> list[int]:
+def build_ccvs_data(speed_kmh: float, brake_active: bool) -> list[int]:
     raw_speed = int(max(0.0, min(float(speed_kmh), 250.996)) * 256)
     data = [0xFF] * 8
     data[1] = raw_speed & 0xFF
     data[2] = (raw_speed >> 8) & 0xFF
+    # SPN 597: Brake switch, byte 4 bits 3-4
+    brake_switch = 0b01 if brake_active else 0b00
+    data[3] = (data[3] & ~(0b11 << 2)) | (brake_switch << 2)
     return data
 
 
@@ -54,31 +55,6 @@ def build_lc_data(left_active: bool, right_active: bool) -> list[int]:
     right_cmd = 0b01 if right_active else 0b00
     left_cmd = 0b01 if left_active else 0b00
     data[1] = (data[1] & 0x0F) | (right_cmd << 4) | (left_cmd << 6)
-    return data
-
-
-def build_dc1_data(door_position: str) -> list[int]:
-    door_map = {
-        "Open (0000)": 0x0,
-        "Closing (0001)": 0x1,
-        "Closed (0010)": 0x2,
-        "Error (1110)": 0xE,
-        "Not available (1111)": 0xF,
-    }
-    data = [0xFF] * 8
-    value = door_map.get(door_position, 0xF)
-    data[0] = (data[0] & 0xF0) | (value & 0x0F)
-    return data
-
-
-def build_class_iv_v_switch_data(camera_view_command: str) -> list[int]:
-    command_map = {
-        "Retain (0x00)": 0x00,
-        "Switch to Class IV (0x04)": 0x04,
-        "Switch to Class V (0x05)": 0x05,
-    }
-    data = [0xFF] * 8
-    data[0] = command_map.get(camera_view_command, 0x00)
     return data
 
 
@@ -193,7 +169,7 @@ class USBCANDevice:
 class SimulatorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("CMS CAN Simulator")
+        self.root.title("J1939/FMS Simulator")
         self.device: USBCANDevice | None = None
         self.send_job: str | None = None
         self.is_connected = False
@@ -217,81 +193,50 @@ class SimulatorApp:
         self.speed_kmh = tk.StringVar(value="0")
         ttk.Entry(main, textvariable=self.speed_kmh).grid(row=2, column=1, sticky="ew")
 
-        ttk.Label(main, text="Source address (0-255 or 0x00-0xFF)").grid(row=3, column=0, sticky="w")
-        self.source_address = tk.StringVar(value=f"0x{SOURCE_ADDRESS:02X}")
-        ttk.Entry(main, textvariable=self.source_address).grid(row=3, column=1, sticky="ew")
+        self.brake_active = tk.BooleanVar(value=False)
+        ttk.Checkbutton(main, text="Brake active", variable=self.brake_active).grid(row=3, column=0, sticky="w")
 
-        ttk.Label(main, text="Gear (SPN 523)").grid(row=4, column=0, sticky="w")
+        self.always_on_top = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            main,
+            text="Always on top",
+            variable=self.always_on_top,
+            command=self._update_always_on_top,
+        ).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(main, text="Source address (0-255 or 0x00-0xFF)").grid(row=4, column=0, sticky="w")
+        self.source_address = tk.StringVar(value=f"0x{SOURCE_ADDRESS:02X}")
+        ttk.Entry(main, textvariable=self.source_address).grid(row=4, column=1, sticky="ew")
+
+        ttk.Label(main, text="Gear (SPN 523)").grid(row=5, column=0, sticky="w")
         self.gear = tk.StringVar(value="Neutral")
         ttk.Combobox(main, textvariable=self.gear, values=["Reverse", "Neutral", "Drive", "Park"], state="readonly").grid(
-            row=4, column=1, sticky="ew"
+            row=5, column=1, sticky="ew"
         )
 
         self.turn_left = tk.BooleanVar(value=False)
         self.turn_right = tk.BooleanVar(value=False)
-        ttk.Checkbutton(main, text="Left turn active", variable=self.turn_left).grid(row=5, column=0, sticky="w")
-        ttk.Checkbutton(main, text="Right turn active", variable=self.turn_right).grid(row=5, column=1, sticky="w")
+        ttk.Checkbutton(main, text="Left turn active", variable=self.turn_left).grid(row=6, column=0, sticky="w")
+        ttk.Checkbutton(main, text="Right turn active", variable=self.turn_right).grid(row=6, column=1, sticky="w")
 
-        ttk.Label(main, text="Enabled PGNs").grid(row=6, column=0, sticky="w")
-        pgn_frame = ttk.Frame(main)
-        pgn_frame.grid(row=6, column=1, sticky="w")
-        self.ccvs_enabled = tk.BooleanVar(value=True)
-        self.etc2_enabled = tk.BooleanVar(value=True)
-        self.lc_enabled = tk.BooleanVar(value=True)
-        self.dc1_enabled = tk.BooleanVar(value=True)
-        self.class_iv_v_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(pgn_frame, text="CCVS", variable=self.ccvs_enabled).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(pgn_frame, text="ETC2", variable=self.etc2_enabled).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Checkbutton(pgn_frame, text="LC", variable=self.lc_enabled).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(pgn_frame, text="DC1", variable=self.dc1_enabled).grid(row=1, column=1, sticky="w", padx=(8, 0))
-        ttk.Checkbutton(pgn_frame, text="Class IV/V", variable=self.class_iv_v_enabled).grid(
-            row=2, column=0, sticky="w", columnspan=2
-        )
-
-        ttk.Label(main, text="Door position (SPN 1821)").grid(row=7, column=0, sticky="w")
-        self.door_position = tk.StringVar(value="Closed (0010)")
-        ttk.Combobox(
-            main,
-            textvariable=self.door_position,
-            values=["Open (0000)", "Closing (0001)", "Closed (0010)", "Error (1110)", "Not available (1111)"],
-            state="readonly",
-        ).grid(row=7, column=1, sticky="ew")
-
-        ttk.Label(main, text="Class IV/V camera command").grid(row=8, column=0, sticky="w")
-        self.camera_view_command = tk.StringVar(value="Retain (0x00)")
-        ttk.Combobox(
-            main,
-            textvariable=self.camera_view_command,
-            values=["Retain (0x00)", "Switch to Class IV (0x04)", "Switch to Class V (0x05)"],
-            state="readonly",
-        ).grid(row=8, column=1, sticky="ew")
-
-        ttk.Label(main, text="Send interval (ms)").grid(row=9, column=0, sticky="w")
+        ttk.Label(main, text="Send interval (ms)").grid(row=7, column=0, sticky="w")
         self.interval_ms = tk.IntVar(value=250)
-        ttk.Entry(main, textvariable=self.interval_ms).grid(row=9, column=1, sticky="ew")
+        ttk.Entry(main, textvariable=self.interval_ms).grid(row=7, column=1, sticky="ew")
 
-        ttk.Label(main, text="CCVS ID/Data").grid(row=10, column=0, sticky="w")
+        ttk.Label(main, text="CCVS ID/Data").grid(row=8, column=0, sticky="w")
         self.ccvs_text = tk.StringVar(value="")
-        ttk.Label(main, textvariable=self.ccvs_text).grid(row=10, column=1, sticky="w")
+        ttk.Label(main, textvariable=self.ccvs_text).grid(row=8, column=1, sticky="w")
 
-        ttk.Label(main, text="ETC2 ID/Data").grid(row=11, column=0, sticky="w")
+        ttk.Label(main, text="ETC2 ID/Data").grid(row=9, column=0, sticky="w")
         self.etc2_text = tk.StringVar(value="")
-        ttk.Label(main, textvariable=self.etc2_text).grid(row=11, column=1, sticky="w")
+        ttk.Label(main, textvariable=self.etc2_text).grid(row=9, column=1, sticky="w")
 
-        ttk.Label(main, text="LC ID/Data").grid(row=12, column=0, sticky="w")
+        ttk.Label(main, text="LC ID/Data").grid(row=10, column=0, sticky="w")
         self.lc_text = tk.StringVar(value="")
-        ttk.Label(main, textvariable=self.lc_text).grid(row=12, column=1, sticky="w")
-
-        ttk.Label(main, text="DC1 ID/Data").grid(row=13, column=0, sticky="w")
-        self.dc1_text = tk.StringVar(value="")
-        ttk.Label(main, textvariable=self.dc1_text).grid(row=13, column=1, sticky="w")
-
-        ttk.Label(main, text="Class IV/V ID/Data").grid(row=14, column=0, sticky="w")
-        self.class_iv_v_text = tk.StringVar(value="")
-        ttk.Label(main, textvariable=self.class_iv_v_text).grid(row=14, column=1, sticky="w")
+        ttk.Label(main, textvariable=self.lc_text).grid(row=10, column=1, sticky="w")
 
         buttons = ttk.Frame(main)
-        buttons.grid(row=15, column=0, columnspan=2, pady=8, sticky="ew")
+        buttons.grid(row=11, column=0, columnspan=2, pady=8, sticky="ew")
         self.connect_button = ttk.Button(buttons, text="Connect", command=self.connect)
         self.connect_button.grid(row=0, column=0, padx=4)
         self.disconnect_button = ttk.Button(buttons, text="Disconnect", command=self.disconnect)
@@ -303,6 +248,9 @@ class SimulatorApp:
 
         self._update_button_states()
         self.refresh_preview()
+
+    def _update_always_on_top(self) -> None:
+        self.root.attributes("-topmost", self.always_on_top.get())
 
     def resolve_dll_path(self) -> str:
         path = self.dll_path.get().strip() or DEFAULT_DLL_NAME
@@ -388,7 +336,7 @@ class SimulatorApp:
             speed = float(self.speed_kmh.get().strip())
         except ValueError:
             speed = 0.0
-        return frame_id, build_ccvs_data(speed)
+        return frame_id, build_ccvs_data(speed, self.brake_active.get())
 
     def current_etc2_frame(self) -> tuple[int, list[int]]:
         frame_id = j1939_id(PRIORITY_DEFAULT, PGN_ETC2, self.current_source_address())
@@ -398,46 +346,19 @@ class SimulatorApp:
         frame_id = j1939_id(PRIORITY_DEFAULT, PGN_LC, self.current_source_address())
         return frame_id, build_lc_data(self.turn_left.get(), self.turn_right.get())
 
-    def current_dc1_frame(self) -> tuple[int, list[int]]:
-        frame_id = j1939_id(PRIORITY_DEFAULT, PGN_DC1, self.current_source_address())
-        return frame_id, build_dc1_data(self.door_position.get())
-
-    def current_class_iv_v_frame(self) -> tuple[int, list[int]]:
-        frame_id = j1939_id(PRIORITY_DEFAULT, PGN_CLASS_IV_V_SWITCH, self.current_source_address())
-        return frame_id, build_class_iv_v_switch_data(self.camera_view_command.get())
-
     def current_frames(self) -> list[tuple[int, list[int]]]:
-        frames: list[tuple[int, list[int]]] = []
-        if self.ccvs_enabled.get():
-            frames.append(self.current_ccvs_frame())
-        if self.etc2_enabled.get():
-            frames.append(self.current_etc2_frame())
-        if self.lc_enabled.get():
-            frames.append(self.current_lc_frame())
-        if self.dc1_enabled.get():
-            frames.append(self.current_dc1_frame())
-        if self.class_iv_v_enabled.get():
-            frames.append(self.current_class_iv_v_frame())
-        return frames
+        return [self.current_ccvs_frame(), self.current_etc2_frame(), self.current_lc_frame()]
 
-    def _format_preview_text(self, enabled: bool, frame_id: int, data: list[int]) -> str:
-        if not enabled:
-            return "Disabled"
+    def _format_preview_text(self, frame_id: int, data: list[int]) -> str:
         return f"0x{frame_id:08X} / {' '.join(f'{byte:02X}' for byte in data)}"
 
     def refresh_preview(self) -> None:
         ccvs_id, ccvs_data = self.current_ccvs_frame()
         etc2_id, etc2_data = self.current_etc2_frame()
         lc_id, lc_data = self.current_lc_frame()
-        dc1_id, dc1_data = self.current_dc1_frame()
-        class_iv_v_id, class_iv_v_data = self.current_class_iv_v_frame()
-        self.ccvs_text.set(self._format_preview_text(self.ccvs_enabled.get(), ccvs_id, ccvs_data))
-        self.etc2_text.set(self._format_preview_text(self.etc2_enabled.get(), etc2_id, etc2_data))
-        self.lc_text.set(self._format_preview_text(self.lc_enabled.get(), lc_id, lc_data))
-        self.dc1_text.set(self._format_preview_text(self.dc1_enabled.get(), dc1_id, dc1_data))
-        self.class_iv_v_text.set(
-            self._format_preview_text(self.class_iv_v_enabled.get(), class_iv_v_id, class_iv_v_data)
-        )
+        self.ccvs_text.set(self._format_preview_text(ccvs_id, ccvs_data))
+        self.etc2_text.set(self._format_preview_text(etc2_id, etc2_data))
+        self.lc_text.set(self._format_preview_text(lc_id, lc_data))
         self.root.after(200, self.refresh_preview)
 
     def _update_button_states(self) -> None:
