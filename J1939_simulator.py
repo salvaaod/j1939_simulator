@@ -31,6 +31,7 @@ REG_VALUE_WINDOW_GEOMETRY = "window_geometry"
 REG_VALUE_SPEED = "speed_kmh"
 REG_VALUE_SOURCE_ADDRESS = "source_address"
 REG_VALUE_SEND_INTERVAL_MS = "send_interval_ms"
+REG_VALUE_ALWAYS_ON_TOP = "always_on_top"
 
 
 def j1939_id(priority: int, pgn: int, source_address: int) -> int:
@@ -267,6 +268,7 @@ class SimulatorApp:
         self.speed_kmh.trace_add("write", self._on_setting_changed)
         self.source_address.trace_add("write", self._on_setting_changed)
         self.interval_ms.trace_add("write", self._on_setting_changed)
+        self.always_on_top.trace_add("write", self._on_setting_changed)
 
     def _save_registry_settings(self) -> None:
         if self._loading_settings or winreg is None:
@@ -278,6 +280,13 @@ class SimulatorApp:
                 winreg.SetValueEx(key, REG_VALUE_SPEED, 0, winreg.REG_SZ, self.speed_kmh.get())
                 winreg.SetValueEx(key, REG_VALUE_SOURCE_ADDRESS, 0, winreg.REG_SZ, self.source_address.get())
                 winreg.SetValueEx(key, REG_VALUE_SEND_INTERVAL_MS, 0, winreg.REG_DWORD, max(0, int(self.interval_ms.get())))
+                winreg.SetValueEx(
+                    key,
+                    REG_VALUE_ALWAYS_ON_TOP,
+                    0,
+                    winreg.REG_DWORD,
+                    1 if self.always_on_top.get() else 0,
+                )
         except Exception:
             # Ignore registry write failures so the simulator can continue working.
             return
@@ -292,6 +301,7 @@ class SimulatorApp:
                 speed = self._read_registry_value(key, REG_VALUE_SPEED, None)
                 source_address = self._read_registry_value(key, REG_VALUE_SOURCE_ADDRESS, None)
                 interval_ms = self._read_registry_value(key, REG_VALUE_SEND_INTERVAL_MS, None)
+                always_on_top = self._read_registry_value(key, REG_VALUE_ALWAYS_ON_TOP, None)
 
                 if isinstance(speed, str) and speed.strip():
                     self.speed_kmh.set(speed)
@@ -299,6 +309,8 @@ class SimulatorApp:
                     self.source_address.set(source_address)
                 if isinstance(interval_ms, int):
                     self.interval_ms.set(max(10, interval_ms))
+                if isinstance(always_on_top, int):
+                    self.always_on_top.set(always_on_top != 0)
                 if isinstance(geometry, str) and geometry.strip():
                     self.root.geometry(geometry)
         except FileNotFoundError:
@@ -306,6 +318,7 @@ class SimulatorApp:
         except Exception:
             pass
         finally:
+            self._update_always_on_top()
             self._loading_settings = False
 
     def _read_registry_value(self, key: "winreg.HKEYType", name: str, default: object) -> object:
