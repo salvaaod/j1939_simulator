@@ -5,6 +5,11 @@ import tkinter as tk
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 USBCAN_II = 4
 DEFAULT_DEVICE_TYPE = USBCAN_II
 DEFAULT_DEVICE_INDEX = 0
@@ -20,6 +25,12 @@ PGN_OEL = 0x00FDCC  # SPN 2876: operator external light controls (turn signals)
 PRIORITY_DEFAULT = 6
 PRIORITY_OEL = 3
 SOURCE_ADDRESS = 0x00
+DEFAULT_INTERVAL_MS = 250
+REGISTRY_SUBKEY = r"Software\J1939Simulator"
+REG_VALUE_WINDOW_GEOMETRY = "window_geometry"
+REG_VALUE_SPEED = "speed_kmh"
+REG_VALUE_SOURCE_ADDRESS = "source_address"
+REG_VALUE_SEND_INTERVAL_MS = "send_interval_ms"
 
 
 def j1939_id(priority: int, pgn: int, source_address: int) -> int:
@@ -174,7 +185,10 @@ class SimulatorApp:
         self.device: USBCANDevice | None = None
         self.send_job: str | None = None
         self.is_connected = False
+        self._loading_settings = False
         self._build_ui()
+        self._load_registry_settings()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -221,7 +235,7 @@ class SimulatorApp:
         ttk.Checkbutton(main, text="Right turn active", variable=self.turn_right).grid(row=6, column=1, sticky="w")
 
         ttk.Label(main, text="Send interval (ms)").grid(row=7, column=0, sticky="w")
-        self.interval_ms = tk.IntVar(value=250)
+        self.interval_ms = tk.IntVar(value=DEFAULT_INTERVAL_MS)
         ttk.Entry(main, textvariable=self.interval_ms).grid(row=7, column=1, sticky="ew")
 
         ttk.Label(main, text="CCVS ID/Data").grid(row=8, column=0, sticky="w")
@@ -249,6 +263,67 @@ class SimulatorApp:
 
         self._update_button_states()
         self.refresh_preview()
+
+        self.speed_kmh.trace_add("write", self._on_setting_changed)
+        self.source_address.trace_add("write", self._on_setting_changed)
+        self.interval_ms.trace_add("write", self._on_setting_changed)
+
+    def _save_registry_settings(self) -> None:
+        if self._loading_settings or winreg is None:
+            return
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REGISTRY_SUBKEY) as key:
+                geometry = self.root.geometry()
+                winreg.SetValueEx(key, REG_VALUE_WINDOW_GEOMETRY, 0, winreg.REG_SZ, geometry)
+                winreg.SetValueEx(key, REG_VALUE_SPEED, 0, winreg.REG_SZ, self.speed_kmh.get())
+                winreg.SetValueEx(key, REG_VALUE_SOURCE_ADDRESS, 0, winreg.REG_SZ, self.source_address.get())
+                winreg.SetValueEx(key, REG_VALUE_SEND_INTERVAL_MS, 0, winreg.REG_DWORD, max(0, int(self.interval_ms.get())))
+        except Exception:
+            # Ignore registry write failures so the simulator can continue working.
+            return
+
+    def _load_registry_settings(self) -> None:
+        if winreg is None:
+            return
+        self._loading_settings = True
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_SUBKEY, 0, winreg.KEY_READ) as key:
+                geometry = self._read_registry_value(key, REG_VALUE_WINDOW_GEOMETRY, None)
+                speed = self._read_registry_value(key, REG_VALUE_SPEED, None)
+                source_address = self._read_registry_value(key, REG_VALUE_SOURCE_ADDRESS, None)
+                interval_ms = self._read_registry_value(key, REG_VALUE_SEND_INTERVAL_MS, None)
+
+                if isinstance(speed, str) and speed.strip():
+                    self.speed_kmh.set(speed)
+                if isinstance(source_address, str) and source_address.strip():
+                    self.source_address.set(source_address)
+                if isinstance(interval_ms, int):
+                    self.interval_ms.set(max(10, interval_ms))
+                if isinstance(geometry, str) and geometry.strip():
+                    self.root.geometry(geometry)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        finally:
+            self._loading_settings = False
+
+    def _read_registry_value(self, key: "winreg.HKEYType", name: str, default: object) -> object:
+        try:
+            value, _value_type = winreg.QueryValueEx(key, name)
+            return value
+        except FileNotFoundError:
+            return default
+        except OSError:
+            return default
+
+    def _on_setting_changed(self, *_args: object) -> None:
+        self._save_registry_settings()
+
+    def _on_close(self) -> None:
+        self._save_registry_settings()
+        self.disconnect()
+        self.root.destroy()
 
     def _update_always_on_top(self) -> None:
         self.root.attributes("-topmost", self.always_on_top.get())
@@ -314,7 +389,7 @@ class SimulatorApp:
         try:
             interval = max(10, int(self.interval_ms.get()))
         except tk.TclError:
-            interval = 250
+            interval = DEFAULT_INTERVAL_MS
         self.send_job = self.root.after(interval, self._send_and_reschedule)
 
     def _send_and_reschedule(self) -> None:
